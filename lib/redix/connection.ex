@@ -26,6 +26,46 @@ defmodule Redix.Connection do
 
   @backoff_exponent 1.5
 
+  ## Functions executed with the checked out socket
+
+  def pipeline(conn, commands, opts) do
+    timeout = opts[:timeout] || 5_000
+    ncommands = length(commands)
+
+    case Connection.call(conn, :checkout_socket, timeout) do
+      {:ok, socket} ->
+        case :gen_tcp.send(socket, Enum.map(commands, &Protocol.pack/1)) do
+          :ok ->
+            resp = recv(socket, ncommands, timeout, nil)
+            Connection.call(conn, :checkin_socket)
+            resp
+          {:error, _reason} = error ->
+            Connection.cast(conn, {:disconnect, error})
+            error
+        end
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp recv(socket, ncommands, timeout, cont) do
+    parser = cont || &Redix.Protocol.parse_multi(&1, ncommands)
+    case :gen_tcp.recv(socket, 0, timeout) do
+      {:ok, data} ->
+        case parser.(data) do
+          {:ok, resp, rest} ->
+            if byte_size(rest) > 0 do
+              Logger.error "there's a rest: #{inspect rest}"
+            end
+            format_resp(resp)
+          {:continuation, cont} ->
+            recv(socket, ncommands, timeout, cont)
+        end
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   ## Callbacks
 
   @doc false
@@ -45,7 +85,6 @@ defmodule Redix.Connection do
   def connect(info, state) do
     case Utils.connect(state) do
       {:ok, state} ->
-        state = start_receiver_and_hand_socket(state)
         {:ok, state}
       {:error, reason} ->
         Logger.error [
@@ -90,22 +129,18 @@ defmodule Redix.Connection do
   @doc false
   def handle_call(operation, from, state)
 
-  def handle_call(_operation, _from, %{socket: nil} = state) do
+  def handle_call(:checkout_socket, _from, %{socket: nil} = state) do
     {:reply, {:error, :closed}, state}
   end
 
-  def handle_call({:commands, commands, request_id}, from, state) do
-    :ok = Receiver.enqueue(state.receiver, {:commands, from, length(commands), request_id})
-    Utils.send_noreply(state, Enum.map(commands, &Protocol.pack/1))
+  def handle_call(:checkout_socket, _from, state) do
+    # Let's deactivate the socket.
+    :ok = :inet.setopts(state.socket, active: false)
+    {:reply, {:ok, state.socket}, state}
   end
 
-  def handle_call({:timed_out, request_id}, _from, state) do
-    :ok = Receiver.timed_out(state.receiver, request_id)
-    {:reply, :ok, state}
-  end
-
-  def handle_call({:cancel_timed_out, request_id}, _from, state) do
-    :ok = Receiver.cancel_timed_out(state.receiver, request_id)
+  def handle_call(:checkin_socket, _from, state) do
+    :ok = :inet.setopts(state.socket, active: :once)
     {:reply, :ok, state}
   end
 
@@ -116,20 +151,27 @@ defmodule Redix.Connection do
     {:disconnect, :stop, state}
   end
 
+  def handle_cast({:disconnect, reason}, state) do
+    {:disconnect, reason, state}
+  end
+
   @doc false
   def handle_info(msg, state)
 
-  def handle_info({:receiver, pid, msg}, %{receiver: pid} = state) do
-    handle_msg_from_receiver(msg, state)
+  def handle_info({:tcp_closed, socket}, %{socket: socket} = state) do
+    {:disconnect, {:error, :tcp_closed}, state}
+  end
+
+  def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state) do
+    {:disconnect, {:error, reason}, state}
   end
 
   ## Helper functions
 
   defp sync_connect(state) do
     case Utils.connect(state) do
-      {:ok, state} ->
-        state = start_receiver_and_hand_socket(state)
-        {:ok, state}
+      {:ok, _state} = result ->
+        result
       {:error, reason} ->
         {:stop, reason}
       {:stop, reason, _state} ->
@@ -141,21 +183,6 @@ defmodule Redix.Connection do
     %{state | socket: nil}
   end
 
-  defp start_receiver_and_hand_socket(%{socket: socket, receiver: receiver} = state) do
-    if receiver && Process.alive?(receiver) do
-      raise "there already is a receiver: #{inspect receiver}"
-    end
-
-    {:ok, receiver} = Receiver.start_link(sender: self(), socket: socket)
-    :ok = :gen_tcp.controlling_process(socket, receiver)
-    %{state | receiver: receiver}
-  end
-
-  defp handle_msg_from_receiver({:tcp_closed, socket}, %{socket: socket} = state) do
-    {:disconnect, {:error, :tcp_closed}, state}
-  end
-
-  defp handle_msg_from_receiver({:tcp_error, socket, reason}, %{socket: socket} = state) do
-    {:disconnect, {:error, reason}, state}
-  end
+  defp format_resp(%Redix.Error{} = err), do: {:error, err}
+  defp format_resp(resp), do: {:ok, resp}
 end
