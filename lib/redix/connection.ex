@@ -1,114 +1,138 @@
 defmodule Redix.Connection do
   @moduledoc false
 
-  use Connection
+  use DBConnection
 
-  alias Redix.Protocol
-  alias Redix.Utils
-  alias Redix.Connection.Receiver
+  defstruct sock: nil, continuation: nil
 
-  require Logger
+  defmodule Query do
+    defstruct [:query]
+  end
 
-  @type state :: %{}
+  defmodule Error do
+    defexception [:function, :reason, :message]
 
-  @initial_state %{
-    # The TCP socket that holds the connection to Redis
-    socket: nil,
-    # Options passed when the connection is started
-    opts: nil,
-    # The receiver process
-    receiver: nil,
-    # TODO: remove but used by Auth right now
-    tail: "",
-    # TODO: document this
-    continuation: nil,
-  }
+    def exception({function, reason}) do
+      message = "#{function} error: #{format_error(reason)}"
+      %Error{function: function, reason: reason, message: message}
+    end
+
+    defp format_error(:unexpected_tail), do: "unexpected tail"
+    defp format_error(:closed), do: "closed"
+    defp format_error(:timeout), do: "timeout"
+    defp format_error(reason), do: :inet.format_error(reason)
+  end
 
   ## Callbacks
 
-  @doc false
-  def init(opts) do
-    {:connect, :init, Map.put(@initial_state, :opts, opts)}
+  def connect(opts) do
+    host        = Keyword.get(opts, :host, "localhost") |> String.to_char_list()
+    port        = Keyword.get(opts, :port, 6379)
+    socket_opts = Keyword.get(opts, :socket_options, [])
+    timeout     = Keyword.get(opts, :connect_timeout, 5_000)
+
+    enforced_opts = [packet: :raw, mode: :binary, active: :once]
+    # :gen_tcp.connect gives priority to options at tail, rather than head.
+    socket_opts = Enum.reverse(socket_opts, enforced_opts)
+    case :gen_tcp.connect(host, port, socket_opts, timeout) do
+      {:ok, sock} ->
+        {:ok, %__MODULE__{sock: sock}}
+      {:error, reason} ->
+        {:error, Error.exception({:connect, reason})}
+    end
   end
 
-  @doc false
-  def connect(info, state)
+  def checkout(state) do
+    case :inet.setopts(state.sock, active: false) do
+      :ok ->
+        flush(state)
+      {:error, reason} ->
+        {:disconnect, Error.exception({:setopts, reason}), state}
+    end
+  end
 
-  def connect(info, state) do
-    case Utils.connect(info, state) do
-      {:ok, state} ->
-        state = start_receiver_and_hand_socket(state)
+  def checkin(state) do
+    case :inet.setopts(state.sock, active: :once) do
+      :ok ->
         {:ok, state}
-      other ->
-        other
+      {:error, reason} ->
+        {:disconnect, Error.exception({:setopts, reason}), state}
     end
   end
 
-  @doc false
-  def disconnect(reason, state)
-
-  def disconnect(:stop, state) do
-    {:stop, :normal, state}
-  end
-
-  def disconnect({:error, reason} = _error, state) do
-    Logger.error ["Disconnected from Redis (#{Utils.format_host(state)}): ",
-                  Utils.format_error(reason)]
-
-    :gen_tcp.close(state.socket)
-
-    # Backoff with 0 ms as the backoff time to churn through all the commands in
-    # the mailbox before reconnecting.
-    {:backoff, 0, reset_state(state)}
-  end
-
-  @doc false
-  def handle_call(operation, from, state)
-
-  def handle_call(_operation, _from, %{socket: nil} = state) do
-    {:reply, {:error, :closed}, state}
-  end
-
-  def handle_call({:commands, commands}, from, state) do
-    :ok = Receiver.enqueue(state.receiver, {:commands, from, length(commands)})
-    Utils.send_noreply(state, Enum.map(commands, &Protocol.pack/1))
-  end
-
-  @doc false
-  def handle_cast(operation, state)
-
-  def handle_cast(:stop, state) do
-    {:disconnect, :stop, state}
-  end
-
-  @doc false
-  def handle_info(msg, state)
-
-  def handle_info({:receiver, pid, msg}, %{receiver: pid} = state) do
-    handle_msg_from_receiver(msg, state)
-  end
-
-  ## Helper functions
-
-  defp reset_state(state) do
-    %{state | socket: nil}
-  end
-
-  defp start_receiver_and_hand_socket(%{socket: socket, tail: tail, receiver: receiver} = state) do
-    if receiver && Process.alive?(receiver) do
-      raise "there already is a receiver: #{inspect receiver}"
+  def handle_execute(%Query{query: :send}, data, _, state) do
+    case :gen_tcp.send(state.sock, data) do
+      :ok ->
+        {:ok, nil, state}
+      {:error, reason} ->
+        {:disconnect, Error.exception({:send, reason}), state}
     end
-
-    {:ok, receiver} = Receiver.start_link(sender: self(), socket: socket, initial_data: tail)
-    :ok = :gen_tcp.controlling_process(socket, receiver)
-    %{state | receiver: receiver, tail: ""}
   end
 
-  defp handle_msg_from_receiver({:tcp_closed, socket}, %{socket: socket} = state) do
-    {:disconnect, {:error, :tcp_closed}, state}
+  def handle_execute(%Query{query: :recv} = query, {ncommands, timeout}, opts, state) do
+    parser = state.continuation || &Redix.Protocol.parse_multi(&1, ncommands)
+    case :gen_tcp.recv(state.sock, 0, timeout) do
+      {:ok, data} ->
+        case parser.(data) do
+          {:ok, resp, ""} ->
+            {:ok, resp, state}
+          {:ok, resp, tail} ->
+            IO.puts "unexpected tail: #{inspect tail}"
+            {:disconnect, Error.exception({:recv, :unexpected_tail}), state}
+          {:continuation, cont} ->
+            state = %{state | continuation: cont}
+            handle_execute(query, {ncommands, timeout}, opts, state)
+        end
+      {:error, reason} ->
+        {:disconnect, Error.exception({:recv, reason}), state}
+    end
   end
 
-  defp handle_msg_from_receiver({:tcp_error, socket, reason}, %{socket: socket} = state) do
-    {:disconnect, {:error, reason}, state}
+  def handle_close(_, _, s) do
+    {:ok, nil, s}
   end
+
+  def handle_info({:tcp_closed, sock}, %{sock: sock} = state) do
+    {:disconnect, Error.exception({:recv, :closed}), state}
+  end
+
+  def handle_info({:tcp_error, sock, reason}, %{sock: sock} = state) do
+    {:disconnect, Error.exception({:recv, reason}), state}
+  end
+
+  def handle_info(_, state), do: {:ok, state}
+
+  def disconnect(_, state) do
+    :ok = :gen_tcp.close(state.sock)
+    _ = flush(state)
+    :ok
+  end
+
+  ## Helpers
+
+  defp flush(%{sock: sock} = state) do
+    receive do
+      {:tcp, ^sock, _data} ->
+        {:disconnect, Error.exception({:recv, :received_unexpected_data}), state}
+      {:tcp_closed, ^sock} ->
+        {:disconnect, Error.exception({:recv, :closed}), state}
+      {:tcp_error, ^sock, reason} ->
+        {:disconnect, Error.exception({:recv, reason}), state}
+    after
+      0 -> {:ok, state}
+    end
+  end
+end
+
+defimpl DBConnection.Query, for: Redix.Connection.Query do
+  alias Redix.Connection.Query
+
+  def parse(%Query{query: tag} = query, _) when tag in [:send, :recv], do: query
+
+  def describe(query, _), do: query
+
+  def encode(%Query{query: :send}, data, _), do: data
+  def encode(%Query{query: :recv}, args, _), do: args
+
+  def decode(_, result, _), do: result
 end

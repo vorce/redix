@@ -152,7 +152,7 @@ defmodule Redix do
   end
 
   def start_link(redis_opts, other_opts) do
-    Utils.start_link(Redix.Connection, redis_opts, other_opts)
+    DBConnection.start_link(Redix.Connection, redis_opts ++ other_opts)
   end
 
   @doc """
@@ -318,10 +318,13 @@ defmodule Redix do
   end
 
   def pipeline(conn, commands, opts) do
+    alias Redix.Connection.Query
+
     if Enum.any?(commands, &(&1 == [])) do
       {:error, :empty_command}
     else
-      Connection.call(conn, {:commands, commands}, opts[:timeout] || @default_timeout)
+      {:ok, _} = DBConnection.query(conn, %Query{query: :send}, Redix.Protocol.pack(commands))
+      DBConnection.query(conn, %Query{query: :recv}, {length(commands), opts[:timeout] || 5000})
     end
   end
 
