@@ -1,3 +1,9 @@
+defmodule Redix.Connection.Worker do
+  def start_link([opts, connection_opts]) do
+    Connection.start_link(Redix.Connection, opts, connection_opts)
+  end
+end
+
 defmodule Redix.Connection do
   @moduledoc false
 
@@ -5,7 +11,6 @@ defmodule Redix.Connection do
 
   alias Redix.Protocol
   alias Redix.Utils
-  alias Redix.Connection.Receiver
 
   require Logger
 
@@ -31,23 +36,25 @@ defmodule Redix.Connection do
   ## Functions executed with the checked out socket
 
   def pipeline(conn, commands, opts) do
-    timeout = opts[:timeout] || 5_000
-    ncommands = length(commands)
+    :poolboy.transaction(conn, fn(conn) ->
+      timeout = opts[:timeout] || 5_000
+      ncommands = length(commands)
 
-    case Connection.call(conn, :checkout_socket, timeout) do
-      {:ok, socket} ->
-        case :gen_tcp.send(socket, Enum.map(commands, &Protocol.pack/1)) do
-          :ok ->
-            resp = recv(socket, ncommands, timeout, nil)
-            Connection.call(conn, :checkin_socket)
-            resp
-          {:error, _reason} = error ->
-            Connection.cast(conn, {:disconnect, error})
-            error
-        end
-      {:error, _reason} = error ->
-        error
-    end
+      case Connection.call(conn, :checkout_socket, timeout) do
+        {:ok, socket} ->
+          case :gen_tcp.send(socket, Enum.map(commands, &Protocol.pack/1)) do
+            :ok ->
+              resp = recv(socket, ncommands, timeout, nil)
+              Connection.call(conn, :checkin_socket)
+              resp
+            {:error, _reason} = error ->
+              Connection.cast(conn, {:disconnect, error})
+              error
+          end
+        {:error, _reason} = error ->
+          error
+      end
+    end)
   end
 
   defp recv(socket, ncommands, timeout, cont) do
