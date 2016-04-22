@@ -11,6 +11,7 @@
   "markdown": {:git, "https://github.com/devinus/markdown.git", "9b3beaf69a9b9c6450526c41d591a94d2eedf1e8", []},
   "mimerl": {:hex, :mimerl, "1.0.0"},
   "poison": {:hex, :poison, "1.5.0"},
+  "poolboy": {:hex, :poolboy, "1.5.1"},
   "redo": {:git, "https://github.com/heroku/redo.git", "936a3c5dcadc8319b349fcad3e5b4c64e98db4d6", []},
   "socket": {:hex, :socket, "0.3.1"},
   "ssl_verify_hostname": {:hex, :ssl_verify_hostname, "1.0.5"},

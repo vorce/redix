@@ -326,12 +326,13 @@ defmodule Redix do
   end
 
   defp do_pipeline(conn, commands, opts) do
-    request_id = make_ref()
-    try do
-      Connection.call(conn, {:commands, commands, request_id}, opts[:timeout] || @default_timeout)
-    catch
-      :exit, {:timeout, {:gen_server, :call, [^conn | _]}} ->
-        Connection.call(conn, {:timed_out, request_id})
+    :poolboy.transaction(conn, fn(conn) ->
+      request_id = make_ref()
+      try do
+        Connection.call(conn, {:commands, commands, request_id}, opts[:timeout] || @default_timeout)
+      catch
+        :exit, {:timeout, {:gen_server, :call, [^conn | _]}} ->
+          Connection.call(conn, {:timed_out, request_id})
 
         receive do
           {ref, _resp} when is_reference(ref) ->
@@ -345,7 +346,8 @@ defmodule Redix do
         end
 
         {:error, :timeout}
-    end
+      end
+    end)
   end
 
   @doc """

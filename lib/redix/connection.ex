@@ -1,3 +1,9 @@
+defmodule Redix.Connection.Worker do
+  def start_link([opts, connection_opts]) do
+    Connection.start_link(Redix.Connection, opts, connection_opts)
+  end
+end
+
 defmodule Redix.Connection do
   @moduledoc false
 

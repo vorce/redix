@@ -38,7 +38,7 @@ defmodule Redix.Utils do
   options to be forwarded to `Connection.start_link/3`.
   """
   @spec start_link(module, Keyword.t, Keyword.t) :: GenServer.on_start
-  def start_link(conn_module, redis_opts, other_opts)
+  def start_link(_conn_module, redis_opts, other_opts)
       when is_list(redis_opts) and is_list(other_opts) do
     # `connection_opts` are the opts to be passed to `Connection.start_link/3`.
     # `redix_opts` are the other options to tweak the behaviour of Redix (e.g.,
@@ -51,7 +51,9 @@ defmodule Redix.Utils do
     redix_opts = Keyword.merge(@redix_default_opts, redix_opts)
     opts = Keyword.merge(redix_opts, redis_opts)
 
-    Connection.start_link(conn_module, opts, connection_opts)
+    size = Application.get_env(:redix, :pool_size, 10)
+    max_overflow = Application.get_env(:redix, :pool_max_overflow, 5)
+    :poolboy.start_link([worker_module: Redix.Connection.Worker, size: size, max_overflow: max_overflow], [opts, connection_opts])
   end
 
   @spec connect(struct) :: {:ok, struct} | {:error, term} | {:stop, term, struct}
