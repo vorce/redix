@@ -20,6 +20,8 @@ defmodule Redix.Connection do
     receiver: nil,
     # TODO: document this
     current_backoff: nil,
+    socket_checked_out?: false,
+    checkout_queue: :queue.new,
   ]
 
   @initial_backoff 500
@@ -133,15 +135,26 @@ defmodule Redix.Connection do
     {:reply, {:error, :closed}, state}
   end
 
+  def handle_call(:checkout_socket, from, %{socket_checked_out?: true} = state) do
+    {:noreply, %{state | checkout_queue: :queue.in(from, state.checkout_queue)}}
+  end
+
   def handle_call(:checkout_socket, _from, state) do
     # Let's deactivate the socket.
     :ok = :inet.setopts(state.socket, active: false)
+    state = %{state | socket_checked_out?: true}
     {:reply, {:ok, state.socket}, state}
   end
 
   def handle_call(:checkin_socket, _from, state) do
-    :ok = :inet.setopts(state.socket, active: :once)
-    {:reply, :ok, state}
+    case :queue.out(state.checkout_queue) do
+      {{:value, from}, new_queue} ->
+        GenServer.reply(from, {:ok, state.socket})
+        {:reply, :ok, %{state | checkout_queue: new_queue}}
+      {:empty, _} ->
+        :ok = :inet.setopts(state.socket, active: :once)
+        {:reply, :ok, %{state | socket_checked_out?: false}}
+    end
   end
 
   @doc false
