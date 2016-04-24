@@ -3,7 +3,7 @@ defmodule Redix.Connection do
 
   use DBConnection
 
-  defstruct sock: nil, continuation: nil
+  defstruct sock: nil, continuation: nil, tail: ""
 
   defmodule Query do
     defstruct [:query]
@@ -17,10 +17,17 @@ defmodule Redix.Connection do
       %Error{function: function, reason: reason, message: message}
     end
 
-    defp format_error(:unexpected_tail), do: "unexpected tail"
-    defp format_error(:closed), do: "closed"
-    defp format_error(:timeout), do: "timeout"
-    defp format_error(reason), do: :inet.format_error(reason)
+    defp format_error(error), do: inspect(error)
+  end
+
+  def pipeline(conn, commands, timeout) do
+    packed_commands = Enum.map(commands, &Redix.Protocol.pack/1)
+    case DBConnection.query(conn, %Query{query: :send}, packed_commands) do
+      {:ok, _} ->
+        DBConnection.query(conn, %Query{query: :recv}, {length(commands), timeout})
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   ## Callbacks
@@ -69,22 +76,30 @@ defmodule Redix.Connection do
     end
   end
 
-  def handle_execute(%Query{query: :recv} = query, {ncommands, timeout}, opts, state) do
+  def handle_execute(%Query{query: :recv} = query, {ncommands, timeout}, opts, %{tail: ""} = state) do
     parser = state.continuation || &Redix.Protocol.parse_multi(&1, ncommands)
     case :gen_tcp.recv(state.sock, 0, timeout) do
       {:ok, data} ->
         case parser.(data) do
-          {:ok, resp, ""} ->
-            {:ok, resp, state}
           {:ok, resp, tail} ->
-            IO.puts "unexpected tail: #{inspect tail}"
-            {:disconnect, Error.exception({:recv, :unexpected_tail}), state}
+            {:ok, resp, %{state | tail: tail}}
           {:continuation, cont} ->
             state = %{state | continuation: cont}
             handle_execute(query, {ncommands, timeout}, opts, state)
         end
       {:error, reason} ->
         {:disconnect, Error.exception({:recv, reason}), state}
+    end
+  end
+
+  def handle_execute(%Query{query: :recv} = query, {ncommands, timeout}, opts, state) do
+    parser = state.continuation || &Redix.Protocol.parse_multi(&1, ncommands)
+    case parser.(state.tail) do
+      {:ok, resp, tail} ->
+        {:ok, resp, %{state | tail: tail}}
+      {:continuation, cont} ->
+        state = %{state | tail: "", continuation: cont}
+        handle_execute(query, {ncommands, timeout}, opts, state)
     end
   end
 
@@ -112,8 +127,8 @@ defmodule Redix.Connection do
 
   defp flush(%{sock: sock} = state) do
     receive do
-      {:tcp, ^sock, _data} ->
-        {:disconnect, Error.exception({:recv, :received_unexpected_data}), state}
+      {:tcp, ^sock, data} ->
+        {:ok, %{state | tail: state.tail <> data}}
       {:tcp_closed, ^sock} ->
         {:disconnect, Error.exception({:recv, :closed}), state}
       {:tcp_error, ^sock, reason} ->
@@ -131,8 +146,8 @@ defimpl DBConnection.Query, for: Redix.Connection.Query do
 
   def describe(query, _), do: query
 
-  def encode(%Query{query: :send}, data, _), do: data
-  def encode(%Query{query: :recv}, args, _), do: args
+  def encode(%Query{query: :send}, packed_commands, _), do: packed_commands
+  def encode(%Query{}, args, _), do: args
 
   def decode(_, result, _), do: result
 end

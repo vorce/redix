@@ -52,8 +52,6 @@ defmodule Redix do
 
   @type command :: [binary]
 
-  alias Redix.Utils
-
   @default_timeout 5000
 
   @doc """
@@ -318,13 +316,10 @@ defmodule Redix do
   end
 
   def pipeline(conn, commands, opts) do
-    alias Redix.Connection.Query
-
     if Enum.any?(commands, &(&1 == [])) do
       {:error, :empty_command}
     else
-      {:ok, _} = DBConnection.query(conn, %Query{query: :send}, Redix.Protocol.pack(commands))
-      DBConnection.query(conn, %Query{query: :recv}, {length(commands), opts[:timeout] || 5000})
+      Redix.Connection.pipeline(conn, commands, opts[:timeout] || @default_timeout)
     end
   end
 
