@@ -21,13 +21,7 @@ defmodule Redix.Connection do
   end
 
   def pipeline(conn, commands, timeout) do
-    packed_commands = Enum.map(commands, &Redix.Protocol.pack/1)
-    case DBConnection.query(conn, %Query{query: :send}, packed_commands) do
-      {:ok, _} ->
-        DBConnection.query(conn, %Query{query: :recv}, {length(commands), timeout})
-      {:error, reason} ->
-        {:error, reason}
-    end
+    DBConnection.query(conn, %Query{query: :pipeline}, {commands, timeout}, pool: DBConnection.Poolboy)
   end
 
   ## Callbacks
@@ -67,16 +61,18 @@ defmodule Redix.Connection do
     end
   end
 
-  def handle_execute(%Query{query: :send}, data, _, state) do
+  def handle_execute(%Query{query: :pipeline} = query, {commands, timeout}, _opts, state) do
+    data = Enum.map(commands, &Redix.Protocol.pack/1)
     case :gen_tcp.send(state.sock, data) do
       :ok ->
-        {:ok, nil, state}
+        recv(length(commands), timeout, state)
       {:error, reason} ->
         {:disconnect, Error.exception({:send, reason}), state}
     end
   end
 
-  def handle_execute(%Query{query: :recv} = query, {ncommands, timeout}, opts, %{tail: ""} = state) do
+  # No tail means we always try to recv new data from the socket.
+  def recv(ncommands, timeout, %{tail: ""} = state) do
     parser = state.continuation || &Redix.Protocol.parse_multi(&1, ncommands)
     case :gen_tcp.recv(state.sock, 0, timeout) do
       {:ok, data} ->
@@ -84,22 +80,22 @@ defmodule Redix.Connection do
           {:ok, resp, tail} ->
             {:ok, resp, %{state | tail: tail}}
           {:continuation, cont} ->
-            state = %{state | continuation: cont}
-            handle_execute(query, {ncommands, timeout}, opts, state)
+            recv(ncommands, timeout, %{state | continuation: cont})
         end
       {:error, reason} ->
         {:disconnect, Error.exception({:recv, reason}), state}
     end
   end
 
-  def handle_execute(%Query{query: :recv} = query, {ncommands, timeout}, opts, state) do
+  # If the tail is not empty, we first try to parse the tail, otherwise we recv
+  # recursively.
+  def handle_execute(ncommands, timeout, state) do
     parser = state.continuation || &Redix.Protocol.parse_multi(&1, ncommands)
     case parser.(state.tail) do
       {:ok, resp, tail} ->
         {:ok, resp, %{state | tail: tail}}
       {:continuation, cont} ->
-        state = %{state | tail: "", continuation: cont}
-        handle_execute(query, {ncommands, timeout}, opts, state)
+        recv(ncommands, timeout, %{state | tail: "", continuation: cont})
     end
   end
 
@@ -142,12 +138,8 @@ end
 defimpl DBConnection.Query, for: Redix.Connection.Query do
   alias Redix.Connection.Query
 
-  def parse(%Query{query: tag} = query, _) when tag in [:send, :recv], do: query
-
-  def describe(query, _), do: query
-
-  def encode(%Query{query: :send}, packed_commands, _), do: packed_commands
+  def parse(%Query{} = query, _), do: query
+  def describe(%Query{} = query, _), do: query
   def encode(%Query{}, args, _), do: args
-
   def decode(_, result, _), do: result
 end

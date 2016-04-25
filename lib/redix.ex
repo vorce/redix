@@ -150,7 +150,9 @@ defmodule Redix do
   end
 
   def start_link(redis_opts, other_opts) do
-    DBConnection.start_link(Redix.Connection, redis_opts ++ other_opts)
+    pool_size = Application.get_env(:redix, :pool_size, 10)
+    opts = redis_opts ++ other_opts ++ [pool: DBConnection.Poolboy, pool_size: pool_size]
+    DBConnection.start_link(Redix.Connection, opts)
   end
 
   @doc """
