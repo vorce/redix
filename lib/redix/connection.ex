@@ -89,7 +89,7 @@ defmodule Redix.Connection do
 
   # If the tail is not empty, we first try to parse the tail, otherwise we recv
   # recursively.
-  def handle_execute(ncommands, timeout, state) do
+  def recv(ncommands, timeout, state) do
     parser = state.continuation || &Redix.Protocol.parse_multi(&1, ncommands)
     case parser.(state.tail) do
       {:ok, resp, tail} ->
